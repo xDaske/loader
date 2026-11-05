@@ -1,0 +1,11 @@
+# Build output
+build/
+dist/
+build_check/
+*.obj
+*.pdb
+*.ilk
+*.exe
+
+# Release artifacts are attached to a GitHub release, never committed.
+*.dat
