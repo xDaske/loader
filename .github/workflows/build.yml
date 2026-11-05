@@ -24,6 +24,15 @@ jobs:
           if not exist dist\loader.exe exit /b 1
           for %%A in (dist\loader.exe) do if %%~zA LSS 500000 exit /b 1
 
+      - name: Verify admin manifest
+        shell: pwsh
+        run: |
+          $text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes('dist/loader.exe'))
+          if ($text -notmatch 'requestedExecutionLevel') {
+            throw 'admin manifest missing from dist/loader.exe'
+          }
+          Write-Host 'manifest: ok'
+
       - uses: actions/upload-artifact@v4
         with:
           name: loader

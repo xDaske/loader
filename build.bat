@@ -29,13 +29,24 @@ if not exist build mkdir build
 
 rem /MT: static CRT, the exe runs on a clean machine.
 rem /utf-8: the sources contain UTF-8 comments.
-cl /nologo /std:c++20 /EHsc /O2 /MT /W4 /permissive- /utf-8 /DUNICODE /D_UNICODE /DNOMINMAX /Fo:build\ /Fd:build\loader.pdb /Fe:dist\loader.exe loader.cpp cleaner.cpp /link /SUBSYSTEM:WINDOWS "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'" user32.lib gdi32.lib advapi32.lib shell32.lib ole32.lib uuid.lib winhttp.lib
+cl /nologo /std:c++20 /EHsc /O2 /MT /W4 /permissive- /utf-8 /DUNICODE /D_UNICODE /DNOMINMAX /Fo:build\ /Fd:build\loader.pdb /Fe:dist\loader.exe loader.cpp cleaner.cpp /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib advapi32.lib shell32.lib ole32.lib uuid.lib winhttp.lib
+if errorlevel 1 goto fail
+
+rem The linker does not always embed the manifest, so stamp it explicitly.
+rem Without it the exe never asks for elevation and cannot open FiveM.
+where mt >nul 2>&1
+if errorlevel 1 goto no_mt
+mt.exe -nologo -manifest "%~dp0loader.manifest" -outputresource:"dist\loader.exe";#1
 if errorlevel 1 goto fail
 
 echo.
 echo   [ok] dist\loader.exe
 for %%A in ("dist\loader.exe") do echo        %%~zA bytes
 exit /b 0
+
+:no_mt
+echo   [!] mt.exe nao encontrado. Rode dentro do "Developer Command Prompt".
+exit /b 1
 
 :no_toolchain
 echo   [!] MSVC x64 nao encontrado.

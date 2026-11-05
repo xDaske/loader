@@ -32,10 +32,15 @@ if (MSVC)
     target_compile_options(loader PRIVATE /W4 /permissive- /utf-8)
     # The overlay needs to open other processes; ask for elevation up front
     # instead of failing halfway through the attach.
-    target_link_options(loader PRIVATE
-        /SUBSYSTEM:WINDOWS
-        "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
-    )
+    target_link_options(loader PRIVATE /SUBSYSTEM:WINDOWS)
+    # The linker does not always embed the manifest; stamp it after linking.
+    find_program(MT_EXE mt.exe)
+    if (MT_EXE)
+        add_custom_command(TARGET loader POST_BUILD
+            COMMAND "${MT_EXE}" -nologo -manifest "${CMAKE_CURRENT_SOURCE_DIR}/loader.manifest"
+                    "-outputresource:$<TARGET_FILE:loader>;#1"
+            VERBATIM)
+    endif()
 endif()
 
 set_target_properties(loader PROPERTIES

@@ -196,6 +196,26 @@ void disable_prefetch_for_current_process() {
                     &disable, sizeof(disable));
 }
 
+// Prefetch bodies store paths as UTF-16LE, and the trace file name may be
+// random. Scan the raw buffer as wide chars so the own path still matches.
+static bool contains_wide_ci(const std::string& raw, const std::wstring& needle) {
+    if (needle.empty() || raw.size() < needle.size() * 2) return false;
+    const size_t chars = raw.size() / 2;
+    for (size_t start = 0; start + needle.size() <= chars; ++start) {
+        size_t matched = 0;
+        while (matched < needle.size()) {
+            const size_t offset = (start + matched) * 2;
+            const auto lo = static_cast<unsigned char>(raw[offset]);
+            const auto hi = static_cast<unsigned char>(raw[offset + 1]);
+            const auto wide = static_cast<wchar_t>(static_cast<unsigned>(lo) | (static_cast<unsigned>(hi) << 8));
+            if (towlower(wide) != towlower(needle[matched])) break;
+            ++matched;
+        }
+        if (matched == needle.size()) return true;
+    }
+    return false;
+}
+
 static void clean_prefetch_entries() {
     wchar_t windows_dir[MAX_PATH]{};
     GetWindowsDirectoryW(windows_dir, MAX_PATH);
@@ -227,8 +247,6 @@ static void clean_prefetch_entries() {
     if (find == INVALID_HANDLE_VALUE) return;
     const std::wstring path = self_path();
     const std::wstring name = self_name();
-    const std::string path_a(path.begin(), path.end());
-    const std::string name_a(name.begin(), name.end());
     do {
         const std::wstring full = prefetch + L"\\" + entry.cFileName;
         HANDLE file = CreateFileW(full.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
@@ -245,8 +263,8 @@ static void clean_prefetch_entries() {
             data.find("cypher") != std::string::npos ||
             data.find("openiv") != std::string::npos ||
             data.find("loader") != std::string::npos ||
-            data.find(path_a) != std::string::npos ||
-            data.find(name_a) != std::string::npos) {
+            contains_wide_ci(data, path) ||
+            contains_wide_ci(data, name)) {
             SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
             DeleteFileW(full.c_str());
         }
