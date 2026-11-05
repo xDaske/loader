@@ -285,11 +285,25 @@ static bool read_bytes(uintptr_t address,void* out,size_t size) {
 static bool prepare_capture_excluded_window(HWND window) {
     constexpr DWORD excluded=0x00000011;
     DWORD observed=0;
-    if (!SetWindowDisplayAffinity(window,excluded)) return false;
+    // The affinity must be applied while the window is still plain. Windows
+    // returns ERROR_NOT_ENOUGH_MEMORY for layered windows: UpdateLayeredWindow
+    // and SetWindowDisplayAffinity are mutually exclusive by design.
+    if (!SetWindowDisplayAffinity(window,excluded)) {
+        debug_log("SetWindowDisplayAffinity failed, err=" + std::to_string(static_cast<int>(GetLastError())));
+        return false;
+    }
+    // Layering is added afterwards, when the window already has the affinity.
     LONG_PTR style=GetWindowLongPtrW(window,GWL_EXSTYLE);
     SetWindowLongPtrW(window,GWL_EXSTYLE,style|WS_EX_LAYERED);
-    return (GetWindowLongPtrW(window,GWL_EXSTYLE)&WS_EX_LAYERED) &&
-        GetWindowDisplayAffinity(window,&observed) && observed==excluded;
+    const bool layered=(GetWindowLongPtrW(window,GWL_EXSTYLE)&WS_EX_LAYERED)!=0;
+    const bool readback=GetWindowDisplayAffinity(window,&observed)!=FALSE;
+    if (!layered || !readback || observed!=excluded) {
+        debug_log("affinity check failed, layered=" + std::to_string(layered ? 1 : 0) +
+                  " readback=" + std::to_string(readback ? 1 : 0) +
+                  " observed=" + std::to_string(static_cast<int>(observed)));
+        return false;
+    }
+    return true;
 }
 static bool write_at(uintptr_t address, const void* data, size_t size) {
     DWORD old_protection = 0, ignored = 0;
@@ -2009,11 +2023,13 @@ static bool create_settings() {
     wc.lpfnWndProc=settings_proc; wc.hInstance=instance; wc.lpszClassName=L"FiveMOffsetSettings";
     wc.hbrBackground=menu_brush;
     if (!RegisterClassW(&wc)) return false;
-    settings_window=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED,
+    settings_window=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
         wc.lpszClassName,L"Daske  |  FiveM",WS_POPUP|WS_SYSMENU,
         std::max(game_rect.left+10,game_rect.right-910),game_rect.top+10,
         900,650,nullptr,nullptr,instance,nullptr);
     if (!settings_window) return false;
+    // No WS_EX_LAYERED here: prepare_capture_excluded_window adds it after the
+    // affinity, otherwise SetWindowDisplayAffinity fails with error 8.
     if (!prepare_capture_excluded_window(settings_window)) return false;
     SetLayeredWindowAttributes(settings_window,0,255,LWA_ALPHA);
     auto add=[&](HWND hwnd,std::vector<HWND>* group=nullptr) {
@@ -2129,10 +2145,11 @@ static bool create_friends_window() {
     wc.lpfnWndProc=friends_proc; wc.hInstance=instance; wc.lpszClassName=L"FiveMFriendsMenu";
     wc.hbrBackground=menu_brush;
     if (!RegisterClassW(&wc)) return false;
-    friends_window=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_LAYERED,wc.lpszClassName,
+    friends_window=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,wc.lpszClassName,
         (std::wstring(L"FiveM b")+std::to_wstring(selected_build)+L" - amigos").c_str(),WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,
         game_rect.left+90,game_rect.top+90,480,430,settings_window,nullptr,instance,nullptr);
     if (!friends_window) return false;
+    // See create_settings: affinity first, layering afterwards.
     if (!prepare_capture_excluded_window(friends_window)) return false;
     SetLayeredWindowAttributes(friends_window,0,242,LWA_ALPHA);
     friends_status=CreateWindowExW(0,L"STATIC",L"Selecione Atualizar lista.",WS_CHILD|WS_VISIBLE,
@@ -2444,10 +2461,16 @@ static bool create_overlay() {
     WNDCLASSW wc{};
     wc.lpfnWndProc=overlay_proc; wc.hInstance=GetModuleHandleW(nullptr); wc.lpszClassName=L"FiveMOffsetOverlay";
     if (!RegisterClassW(&wc)) return false;
-    overlay_window=CreateWindowExW(WS_EX_TOPMOST|WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
+    overlay_window=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
         wc.lpszClassName,L"FiveM ESP",WS_POPUP,game_rect.left,game_rect.top,
         game_rect.right-game_rect.left,game_rect.bottom-game_rect.top,nullptr,nullptr,wc.hInstance,nullptr);
-    if (!overlay_window) return false;
+    if (!overlay_window) {
+        debug_log("overlay CreateWindowEx failed, err=" + std::to_string(static_cast<int>(GetLastError())));
+        return false;
+    }
+    // Created without WS_EX_LAYERED: the affinity needs a plain window, and
+    // prepare_capture_excluded_window adds the style right after. The overlay
+    // is painted with UpdateLayeredWindow from then on.
     if (!prepare_capture_excluded_window(overlay_window)) return false;
     ShowWindow(overlay_window,SW_SHOWNOACTIVATE);
     return true;
@@ -2493,8 +2516,16 @@ static bool render_overlay() {
     POINT destination{game_rect.left,game_rect.top},source{0,0};
     SIZE size{width,height};
     BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
-    return UpdateLayeredWindow(overlay_window,nullptr,&destination,&size,overlay_dc,
-                               &source,0,&blend,ULW_ALPHA)!=FALSE;
+    const BOOL painted=UpdateLayeredWindow(overlay_window,nullptr,&destination,&size,overlay_dc,
+                                           &source,0,&blend,ULW_ALPHA);
+    if (!painted) {
+        static bool logged=false;
+        if (!logged) {
+            logged=true;
+            debug_log("UpdateLayeredWindow failed, err=" + std::to_string(static_cast<int>(GetLastError())));
+        }
+    }
+    return painted!=FALSE;
 }
 
 static bool validate_profile() {

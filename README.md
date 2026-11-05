@@ -67,11 +67,15 @@ se chama exatamente `loader.exe` em `releases/latest/download/`.
 
 - **F1** abre/fecha o painel.
 - **F2** também abre/fecha o painel.
+- O painel só responde quando a janela do FiveM (ou o próprio painel) está em foco.
 - A tecla de saída configurada ejeta o hook e encerra.
 - As três janelas (painel, amigos e overlay) usam `WDA_EXCLUDEFROMCAPTURE`
   (0x11): não aparecem em OBS, Xbox Game Bar nem captura por desktop duplication.
   Se o Windows for anterior ao 10 2004, a criação da janela falha em vez de rodar
   sem streamproof.
+- As janelas nascem **sem** `WS_EX_LAYERED` e recebem o estilo depois da afinidade:
+  `UpdateLayeredWindow` e `SetWindowDisplayAffinity` são mutuamente exclusivos
+  (a segunda falha com erro 8 em janela já em camadas).
 
 ## Linha de comando
 
@@ -84,6 +88,10 @@ se chama exatamente `loader.exe` em `releases/latest/download/`.
 | `--verbose` | Mostra o progresso no console do processo pai (nada em disco) |
 
 `--verbose` sozinho não inicia o Destruct; só liga o log.
+
+Para diagnosticar a inicialização do overlay, rode com a variável
+`LOADER_DEBUG=1`: o caminho percorrido é gravado em `%TEMP%\loader-debug.log`.
+Sem a variável, nada é escrito.
 
 ## O que o Destruct remove
 
