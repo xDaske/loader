@@ -29,7 +29,9 @@ cmake --build build --config Release
 ```
 
 Os dois arquivos que entram no build são `loader.cpp` (overlay) e `cleaner.cpp`
-(passe de limpeza). `cleaner.h` é a única interface entre eles.
+(passe de limpeza). `cleaner.h` é a única interface entre eles. O manifesto
+(`loader.manifest`) é carimbado no `loader.exe` pelo `mt.exe`, porque o linker do
+MSVC nem sempre o embute — sem ele o executável não pede elevação.
 
 O workflow `.github/workflows/build.yml` compila com MSVC no GitHub Actions a cada
 tag `v*` e anexa `dist/loader.exe` ao release. `dist/` está no `.gitignore`: o
