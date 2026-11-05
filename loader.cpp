@@ -45,6 +45,23 @@
 #include "cleaner.h"
 
 
+// Opt-in diagnostics: with LOADER_DEBUG=1 the startup path is appended to
+// %TEMP%\loader-debug.log. Nothing is written when the variable is absent.
+static void debug_log(const std::string& message) {
+    const char* enabled = std::getenv("LOADER_DEBUG");
+    if (!enabled || !*enabled) return;
+    wchar_t temp[MAX_PATH]{};
+    if (!GetTempPathW(MAX_PATH, temp)) return;
+    const std::wstring path = std::wstring(temp) + L"loader-debug.log";
+    HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
+                              nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    const std::string line = message + "\r\n";
+    DWORD written = 0;
+    WriteFile(file, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+    CloseHandle(file);
+}
+
 struct Vec3 { float x, y, z; };
 struct Screen { float x, y; };
 static constexpr std::array<uint32_t, 16> bone_masks{
@@ -2518,13 +2535,19 @@ static bool eject_runtime() {
 }
 
 int main() {
+    debug_log("start");
     // Before the CLI branch: a --destruct run must not leave a .pf either.
     cleaner::disable_prefetch_for_current_process();
     if (cleaner::handle_cli()) return 0;
     // Install mode leaves the binary on disk; drop the download mark right away.
     cleaner::strip_self_zone_identifier();
+    debug_log("cli=overlay");
     try {
-        if (!find_process()) throw std::runtime_error("FiveM b3095/b3258/b3889 nao encontrado ou sem acesso");
+        if (!find_process()) {
+            debug_log("find_process: no matching process or no access");
+            throw std::runtime_error("FiveM b3095/b3258/b3889 nao encontrado ou sem acesso");
+        }
+        debug_log("found pid=" + std::to_string(process_id) + " build=" + std::to_string(selected_build));
         load_embedded_offsets();
         while (WaitForSingleObject(process_handle,0)==WAIT_TIMEOUT) {
             game_window=nullptr;
@@ -2532,12 +2555,31 @@ int main() {
             if (game_window && update_game_rect()) break;
             Sleep(250);
         }
-        if (!game_window || !update_game_rect()) throw std::runtime_error("Janela do FiveM nao encontrada");
+        if (!game_window || !update_game_rect()) {
+            debug_log("game window: not found");
+            throw std::runtime_error("Janela do FiveM nao encontrada");
+        }
+        debug_log("window rect=" + std::to_string(game_rect.left) + "," + std::to_string(game_rect.top) +
+                  " " + std::to_string(game_rect.right-game_rect.left) + "x" +
+                  std::to_string(game_rect.bottom-game_rect.top));
         profile_ready=validate_profile();
+        debug_log(profile_ready ? "profile: ok" : "profile: not ready");
         if (profile_ready) prepare_hook();
-        if (!create_overlay()) throw std::runtime_error("Falha ao criar overlay");
-        if (!create_settings()) throw std::runtime_error("Falha ao criar painel de offsets");
-        if (!create_friends_window()) throw std::runtime_error("Falha ao criar painel de amigos");
+        if (!create_overlay()) {
+            debug_log("create_overlay: failed");
+            throw std::runtime_error("Falha ao criar overlay");
+        }
+        debug_log("overlay: ok");
+        if (!create_settings()) {
+            debug_log("create_settings: failed");
+            throw std::runtime_error("Falha ao criar painel de offsets");
+        }
+        debug_log("settings: ok");
+        if (!create_friends_window()) {
+            debug_log("create_friends_window: failed");
+            throw std::runtime_error("Falha ao criar painel de amigos");
+        }
+        debug_log("friends: ok; loop entered");
         start_los();
         names_running=true;
         names_thread=std::thread(name_refresh_loop);
@@ -2556,7 +2598,7 @@ int main() {
             if (capturing_bind>=0) {
                 for (int key=1;key<256;++key) poll_key(key);
             } else {
-                const std::array<int,8> active_keys{VK_F2,app_settings.aim_key,app_settings.unlock_key,
+                const std::array<int,9> active_keys{VK_F1,VK_F2,app_settings.aim_key,app_settings.unlock_key,
                     app_settings.repair_key,
                     app_settings.player_esp_key,app_settings.vehicle_esp_key,app_settings.fov_key,
                     app_settings.exit_key};
@@ -2603,12 +2645,14 @@ int main() {
                 MessageBoxA(settings_window,"Nao foi possivel restaurar o hook ou liberar a memoria. O app continua aberto para tentar novamente.",
                     "Ejecao incompleta",MB_OK|MB_ICONERROR);
             }
-            if (!capture_was_active && pressed[VK_F2] && (game_active||menu_active)) {
+            if (!capture_was_active && (pressed[VK_F2] || pressed[VK_F1]) && (game_active||menu_active)) {
                 bool visible = IsWindowVisible(settings_window) != FALSE;
                 if (visible) cancel_bind_capture();
                 if (visible && friends_window) ShowWindow(friends_window,SW_HIDE);
                 if (visible) active_edit=nullptr;
                 ShowWindow(settings_window,visible ? SW_HIDE : SW_SHOWNOACTIVATE);
+                debug_log(std::string("menu ") + (visible ? "hidden" : "shown") +
+                          " foreground=" + (game_active ? "game" : menu_active ? "menu" : "other"));
             }
             if (!update_game_rect()) {
                 ShowWindow(overlay_window,SW_HIDE);
@@ -2711,6 +2755,7 @@ int main() {
             render_overlay();
             Sleep(16);
         }
+        debug_log(std::string("loop exit running=") + (running ? "1" : "0"));
         bool ejected=eject_runtime();
         // Fire the pass as soon as ejection succeeded; the teardown below runs
         // in parallel with it. Build-time switch, plus the explicit-exit gate:
@@ -2744,6 +2789,7 @@ int main() {
         }
         return 0;
     } catch (const std::exception& e) {
+        debug_log(std::string("error: ") + e.what());
         bool ejected=eject_runtime();
         stop_los();
         names_running=false;
