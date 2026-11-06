@@ -88,6 +88,8 @@ static void note_removed(unsigned long count = 1) {
 static void note_failed() { ++g_pass_failed; }
 
 static void note_detail(const std::wstring& text) {
+    // A per-file result repeated three times is noise, not information.
+    if (g_pass_detail.find(text) != std::wstring::npos) return;
     if (g_pass_detail.empty()) g_pass_detail = text;
     else g_pass_detail += L"; " + text;
 }
@@ -631,9 +633,13 @@ static void clean_amcache() {
     const std::wstring hive = dir + L"\\Amcache.hve";
     const wchar_t* mount = L"AMCACHE_TMP";
     RegUnLoadKeyW(HKEY_LOCAL_MACHINE, mount);
-    if (RegLoadKeyW(HKEY_LOCAL_MACHINE, mount, hive.c_str()) != ERROR_SUCCESS) {
-        note_detail(std::wstring(L"hive nao carregou") +
-                    (backup && restore ? L"" : L", privilegios indisponiveis"));
+    const LSTATUS load_status = RegLoadKeyW(HKEY_LOCAL_MACHINE, mount, hive.c_str());
+    if (load_status != ERROR_SUCCESS) {
+        note_failed();
+        std::wstring reason = std::wstring(L"hive nao carregou (erro ") +
+                              std::to_wstring(load_status) + L")";
+        if (!backup || !restore) reason += L", privilegios indisponiveis";
+        note_detail(reason);
         return;
     }
 
@@ -720,8 +726,20 @@ static void clean_amcache() {
         }
         RegCloseKey(root);
     }
-    RegFlushKey(HKEY_LOCAL_MACHINE);
-    RegUnLoadKeyW(HKEY_LOCAL_MACHINE, mount);
+    // Unload must be asserted: on failure the hive stays mounted and the next
+    // run cannot load it again, which used to look like "nothing to remove".
+    LSTATUS unload_status = ERROR_SUCCESS;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        RegFlushKey(HKEY_LOCAL_MACHINE);
+        unload_status = RegUnLoadKeyW(HKEY_LOCAL_MACHINE, mount);
+        if (unload_status == ERROR_SUCCESS) break;
+        Sleep(200);
+    }
+    if (unload_status != ERROR_SUCCESS) {
+        note_failed();
+        note_detail(std::wstring(L"hive nao descarregou (erro ") +
+                    std::to_wstring(unload_status) + L")");
+    }
 
     // The transaction manager keeps replayable copies of the deleted keys in
     // Amcache.hve{GUID}.TM.blf and .TMContainer*.regtrans-ms, not in .LOG1.
