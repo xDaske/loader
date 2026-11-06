@@ -864,7 +864,70 @@ static void delete_if_exists(const std::wstring& path) {
         return;
     }
     const DWORD error = GetLastError();
-    if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) note_failed();
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return;
+
+    // The running image is deleted by the detached script after this process
+    // exits; counting it as a failed delete would report a false residue.
+    std::wstring lower = path;
+    for (auto& c : lower) c = static_cast<wchar_t>(towlower(c));
+    if (lower == self_path()) return;
+    note_failed();
+}
+
+// True when PendingFileRenameOperations already deletes this path at boot, so
+// repeated runs do not queue the same file twice.
+static bool reboot_delete_pending(const std::wstring& path) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SYSTEM\\CurrentControlSet\\Control\\Session Manager",
+                      0, KEY_READ, &key) != ERROR_SUCCESS)
+        return false;
+
+    bool found = false;
+    DWORD type = 0;
+    DWORD size = 0;
+    if (RegQueryValueExW(key, L"PendingFileRenameOperations", nullptr, &type, nullptr, &size) == ERROR_SUCCESS &&
+        type == REG_MULTI_SZ && size > 2) {
+        std::vector<wchar_t> buffer(size / sizeof(wchar_t) + 2);
+        if (RegQueryValueExW(key, L"PendingFileRenameOperations", nullptr, &type,
+                             reinterpret_cast<LPBYTE>(buffer.data()), &size) == ERROR_SUCCESS) {
+            std::wstring lower = path;
+            for (auto& c : lower) c = static_cast<wchar_t>(towlower(c));
+            for (const wchar_t* entry = buffer.data(); *entry; entry += wcslen(entry) + 1) {
+                std::wstring candidate(entry);
+                for (auto& c : candidate) c = static_cast<wchar_t>(towlower(c));
+                if (candidate.find(lower) != std::wstring::npos) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+    RegCloseKey(key);
+    return found;
+}
+
+// Some files (notably ActivitiesCache.db, held open by the Connected Devices
+// Platform service) cannot be deleted while the service runs. Queue them for
+// removal at the next boot instead of leaving the artifact behind.
+static void delete_or_schedule(const std::wstring& path) {
+    SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+    if (DeleteFileW(path.c_str())) {
+        note_removed();
+        return;
+    }
+    const DWORD error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return;
+    if (reboot_delete_pending(path)) {
+        note_removed();
+        return;
+    }
+    if (MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT)) {
+        note_removed();
+        note_detail(L"travados: agendados para o proximo boot");
+        return;
+    }
+    note_failed();
 }
 
 static void delete_temp_pattern(const std::wstring& dir, const wchar_t* pattern) {
@@ -1272,7 +1335,7 @@ static void clean_timeline() {
         const std::wstring dir = base + L"\\" + entry.cFileName;
         for (const wchar_t* file : { L"\\ActivitiesCache.db", L"\\ActivitiesCache.db-wal",
                                      L"\\ActivitiesCache.db-shm", L"\\ActivitiesCache.db-journal" })
-            delete_if_exists(dir + file);
+            delete_or_schedule(dir + file);
     } while (FindNextFileW(find, &entry));
     FindClose(find);
 }
