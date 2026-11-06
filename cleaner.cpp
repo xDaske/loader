@@ -43,19 +43,24 @@
 // ---------------------------------------------------------------------------
 namespace cleaner {
 
-static void enable_privilege(const wchar_t* privilege) {
+static bool enable_privilege(const wchar_t* privilege) {
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
-        return;
+        return false;
+    bool enabled = false;
     TOKEN_PRIVILEGES tp{};
     LUID luid{};
     if (LookupPrivilegeValueW(nullptr, privilege, &luid)) {
         tp.PrivilegeCount = 1;
         tp.Privileges[0].Luid = luid;
         tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+        // AdjustTokenPrivileges reports success even when it assigned nothing;
+        // ERROR_NOT_ALL_ASSIGNED is the real answer.
+        enabled = AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr) != 0 &&
+                  GetLastError() == ERROR_SUCCESS;
     }
     CloseHandle(token);
+    return enabled;
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +72,22 @@ static void enable_privilege(const wchar_t* privilege) {
 static std::atomic<bool> g_verbose{false};
 static std::atomic<unsigned long long> g_progress{0};
 static std::atomic<bool> g_watchdog_started{false};
+
+// Per-pass bookkeeping. The two cleaner threads run different passes, so a
+// thread-local slot is enough and keeps the counters race-free.
+static thread_local unsigned long g_pass_removed = 0;
+static thread_local bool g_pass_counted = false;
+static thread_local std::wstring g_pass_detail;
+
+static void note_removed(unsigned long count = 1) {
+    g_pass_removed += count;
+    g_pass_counted = true;
+}
+
+static void note_detail(const std::wstring& text) {
+    if (g_pass_detail.empty()) g_pass_detail = text;
+    else g_pass_detail += L"; " + text;
+}
 
 static void verbose_attach_console() {
     if (!AttachConsole(ATTACH_PARENT_PROCESS)) return;
@@ -179,6 +200,15 @@ static bool contains_token(const std::wstring& haystack, const std::wstring& nee
     return false;
 }
 
+// File-name stems used by this tool and by the builds it replaces. The match
+// is token aware: "loader_1721518693.exe" and "fivem_esp_x.exe" match, while
+// "downloader.exe" does not.
+static bool matches_tool_family(const std::wstring& lower) {
+    for (const wchar_t* token : { L"loader", L"fivem_esp", L"phantom", L"cypher", L"openiv" })
+        if (contains_token(lower, token)) return true;
+    return lower.find(L"ph_") != std::wstring::npos;
+}
+
 // Forward declaration: clean_amcache runs before the definition below.
 static void delete_if_exists(const std::wstring& path);
 
@@ -236,7 +266,7 @@ static void clean_prefetch_entries() {
         do {
             const std::wstring full = prefetch + L"\\" + entry.cFileName;
             SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
-            DeleteFileW(full.c_str());
+            if (DeleteFileW(full.c_str())) note_removed();
         } while (FindNextFileW(find, &entry));
         FindClose(find);
     }
@@ -274,21 +304,34 @@ static void clean_prefetch_entries() {
 
 // Background Activity Moderator: per-user execution history under SYSTEM.
 static void clean_bam_entries() {
-    enable_privilege(L"SeBackupPrivilege");
-    enable_privilege(L"SeRestorePrivilege");
+    // BAM is ACL-protected: a plain administrator token is denied (error 5).
+    // Opening it needs SeBackupPrivilege and SeRestorePrivilege enabled, so the
+    // result of the adjustment decides which open path to try first.
+    const bool backup = enable_privilege(L"SeBackupPrivilege");
+    const bool restore = enable_privilege(L"SeRestorePrivilege");
     enable_privilege(L"SeTakeOwnershipPrivilege");
 
     const wchar_t* key_path = L"SYSTEM\\CurrentControlSet\\Services\\bam\\State\\UserSettings";
     HKEY root = nullptr;
-    LSTATUS status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_path, REG_OPTION_BACKUP_RESTORE,
-                                   KEY_ALL_ACCESS | KEY_WOW64_64KEY, &root);
-    if (status != ERROR_SUCCESS)
+    LSTATUS status = ERROR_ACCESS_DENIED;
+    if (backup && restore) {
+        status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_path, REG_OPTION_BACKUP_RESTORE,
+                               KEY_ALL_ACCESS | KEY_WOW64_64KEY, &root);
+    }
+    if (!root) {
         status = RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_path, 0,
                                KEY_ALL_ACCESS | KEY_WOW64_64KEY, &root);
-    if (status != ERROR_SUCCESS) return;
+    }
+    if (!root) {
+        note_detail(std::wstring(L"chave inacessivel, erro ") +
+                    std::to_wstring(static_cast<long>(status)) +
+                    (backup && restore ? L"" : L", privilegios indisponiveis"));
+        return;
+    }
 
-    const std::wstring path = self_path();
     const std::wstring name = self_name();
+    unsigned long unreadable = 0;
+    unsigned long failed = 0;
     for (DWORD index = 0;; ++index) {
         wchar_t sub_key[256];
         DWORD sub_length = 256;
@@ -300,7 +343,10 @@ static void clean_bam_entries() {
                                        KEY_ALL_ACCESS | KEY_WOW64_64KEY, &user_key);
         if (opened != ERROR_SUCCESS)
             opened = RegOpenKeyExW(root, sub_key, 0, KEY_ALL_ACCESS | KEY_WOW64_64KEY, &user_key);
-        if (opened != ERROR_SUCCESS) continue;
+        if (opened != ERROR_SUCCESS) {
+            ++unreadable;
+            continue;
+        }
 
         std::vector<std::wstring> to_delete;
         for (DWORD value_index = 0;; ++value_index) {
@@ -311,19 +357,20 @@ static void clean_bam_entries() {
                 break;
             std::wstring lower(value_name);
             for (auto& c : lower) c = static_cast<wchar_t>(towlower(c));
-            if (lower.find(L"phantom") != std::wstring::npos ||
-                lower.find(L"cypher") != std::wstring::npos ||
-                lower.find(L"ph_") != std::wstring::npos ||
-                lower.find(L"openiv") != std::wstring::npos ||
-                lower.find(L"loader") != std::wstring::npos ||
-                lower.find(name) != std::wstring::npos ||
-                lower.find(path) != std::wstring::npos)
+            if (matches_tool_family(lower) ||
+                (name.size() >= 4 && contains_token(lower, name)))
                 to_delete.push_back(value_name);
         }
-        for (const auto& value : to_delete) RegDeleteValueW(user_key, value.c_str());
+        for (const auto& value : to_delete) {
+            if (RegDeleteValueW(user_key, value.c_str()) == ERROR_SUCCESS) note_removed();
+            else ++failed;
+        }
         RegCloseKey(user_key);
     }
     RegCloseKey(root);
+
+    if (unreadable) note_detail(std::to_wstring(unreadable) + L" subchaves ilegiveis");
+    if (failed) note_detail(std::to_wstring(failed) + L" valores recusados");
 }
 
 static void clean_temp_dlls() {
@@ -747,7 +794,7 @@ static void wipe_self_strings() {
 
 static void delete_if_exists(const std::wstring& path) {
     SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
-    DeleteFileW(path.c_str());
+    if (DeleteFileW(path.c_str())) note_removed();
 }
 
 static void delete_temp_pattern(const std::wstring& dir, const wchar_t* pattern) {
@@ -826,7 +873,8 @@ static void strip_zone_identifier(const std::wstring& path) {
 
 static bool value_has_token(HKEY key, const wchar_t* name,
                             const std::wstring& path_needle,
-                            const std::wstring& name_needle) {
+                            const std::wstring& name_needle,
+                            bool family = false) {
     DWORD type = 0, size = 0;
     if (RegQueryValueExW(key, name, nullptr, &type, nullptr, &size) != ERROR_SUCCESS)
         return false;
@@ -839,7 +887,8 @@ static bool value_has_token(HKEY key, const wchar_t* name,
     if (type == REG_SZ || type == REG_EXPAND_SZ) {
         std::wstring text(reinterpret_cast<const wchar_t*>(data.data()), size / sizeof(wchar_t));
         for (auto& c : text) c = static_cast<wchar_t>(towlower(c));
-        return contains_token(text, path_needle) || contains_token(text, name_needle);
+        return contains_token(text, path_needle) || contains_token(text, name_needle) ||
+               (family && matches_tool_family(text));
     }
     if (type == REG_BINARY) {
         const size_t path_width = path_needle.size() * sizeof(wchar_t);
@@ -859,11 +908,12 @@ static bool value_has_token(HKEY key, const wchar_t* name,
 }
 
 // Deletes values and, up to depth, subkeys whose name or payload mentions the
-// binary. PIDL values (ComDlg32) are binary, hence the byte scan.
+// binary. PIDL values (ComDlg32) are binary, hence the byte scan. With family
+// set, old copies of the tool under another name (loader_<random>.exe) match too.
 static void scrub_key_matches(HKEY root, const std::wstring& subkey,
                               const std::wstring& path_needle,
                               const std::wstring& name_needle,
-                              int depth) {
+                              int depth, bool family = false) {
     HKEY key = nullptr;
     if (RegOpenKeyExW(root, subkey.c_str(), 0,
                       KEY_READ | KEY_WRITE | KEY_ENUMERATE_SUB_KEYS, &key) != ERROR_SUCCESS)
@@ -880,10 +930,12 @@ static void scrub_key_matches(HKEY root, const std::wstring& subkey,
         for (auto& c : lower) c = static_cast<wchar_t>(towlower(c));
 
         if (contains_token(lower, path_needle) || contains_token(lower, name_needle) ||
-            value_has_token(key, name, path_needle, name_needle))
+            (family && matches_tool_family(lower)) ||
+            value_has_token(key, name, path_needle, name_needle, family))
             to_delete.push_back(name);
     }
-    for (const auto& name : to_delete) RegDeleteValueW(key, name.c_str());
+    for (const auto& name : to_delete)
+        if (RegDeleteValueW(key, name.c_str()) == ERROR_SUCCESS) note_removed();
 
     if (depth > 0) {
         std::vector<std::wstring> children;
@@ -897,11 +949,12 @@ static void scrub_key_matches(HKEY root, const std::wstring& subkey,
         for (const auto& child : children) {
             std::wstring lower(child);
             for (auto& c : lower) c = static_cast<wchar_t>(towlower(c));
-            if (contains_token(lower, path_needle) || contains_token(lower, name_needle)) {
-                RegDeleteTreeW(key, child.c_str());
+            if (contains_token(lower, path_needle) || contains_token(lower, name_needle) ||
+                (family && matches_tool_family(lower))) {
+                if (RegDeleteTreeW(key, child.c_str()) == ERROR_SUCCESS) note_removed();
                 continue;
             }
-            scrub_key_matches(key, child, path_needle, name_needle, depth - 1);
+            scrub_key_matches(key, child, path_needle, name_needle, depth - 1, family);
         }
     }
     RegCloseKey(key);
@@ -1117,7 +1170,7 @@ static void clean_helper_prefetch() {
         do {
             const std::wstring full = prefetch + L"\\" + entry.cFileName;
             SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
-            DeleteFileW(full.c_str());
+            if (DeleteFileW(full.c_str())) note_removed();
         } while (FindNextFileW(find, &entry));
         FindClose(find);
     }
@@ -1228,36 +1281,46 @@ static void flush_dns() {
 
 // RecentDocs, MuiCache, RunMRU, AppSwitched, ComDlg32 PIDLs, Search history and
 // the compatibility store all name the binary. None of them are in the original.
+// Every sweep passes family=true: portable mode gives the binary a random name
+// (loader_<digits>.exe), so an exact self-name match cannot see older copies.
 static void clean_registry_history() {
     const std::wstring path = self_path();
     const std::wstring name = self_name() + L".exe";
     const std::wstring explorer = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer";
 
-    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\RunMRU", path, name, 0);
-    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\TypedPaths", path, name, 0);
-    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\RecentDocs", path, name, 1);
-    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\ComDlg32\\OpenSavePidlMRU", path, name, 1);
-    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\ComDlg32\\LastVisitedPidlMRU", path, name, 1);
-    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\FeatureUsage\\AppSwitched", path, name, 0);
-    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\FeatureUsage\\AppLaunch", path, name, 0);
-    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\FileExts\\.exe\\OpenWithList", path, name, 0);
+    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\RunMRU", path, name, 0, true);
+    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\TypedPaths", path, name, 0, true);
+    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\RecentDocs", path, name, 1, true);
+    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\ComDlg32\\OpenSavePidlMRU", path, name, 1, true);
+    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\ComDlg32\\LastVisitedPidlMRU", path, name, 1, true);
+    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\FeatureUsage\\AppSwitched", path, name, 0, true);
+    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\FeatureUsage\\AppLaunch", path, name, 0, true);
+    scrub_key_matches(HKEY_CURRENT_USER, explorer + L"\\FileExts\\.exe\\OpenWithList", path, name, 0, true);
     scrub_key_matches(HKEY_CURRENT_USER,
-        L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\MuiCache", path, name, 0);
+        L"Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\MuiCache", path, name, 0, true);
     scrub_key_matches(HKEY_CURRENT_USER,
         L"Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Compatibility Assistant\\Store",
-        path, name, 0);
+        path, name, 0, true);
     scrub_key_matches(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Search\\RecentApps", path, name, 1);
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Search\\RecentApps", path, name, 1, true);
     scrub_key_matches(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Search\\WordWheelQuery", path, name, 0);
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Search\\WordWheelQuery", path, name, 0, true);
 }
 
 // Every step is best-effort: one failing pass must not abort the rest, and an
 // exception escaping the thread lambda would call std::terminate mid-cleanup.
 static void run_pass(const wchar_t* name, void (*pass)()) {
-    log_line(name);
+    log_line(std::wstring(name) + L": iniciando");
+    g_pass_removed = 0;
+    g_pass_counted = false;
+    g_pass_detail.clear();
     try {
         pass();
+        std::wstring summary = g_pass_counted
+            ? std::wstring(name) + L": " + std::to_wstring(g_pass_removed) + L" removidos"
+            : std::wstring(name) + L": ok";
+        if (!g_pass_detail.empty()) summary += L" (" + g_pass_detail + L")";
+        log_line(summary);
     } catch (...) {
         log_line(std::wstring(L"falhou: ") + name);
     }

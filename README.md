@@ -89,6 +89,20 @@ se chama exatamente `loader.exe` em `releases/latest/download/`.
 
 `--verbose` sozinho não inicia o Destruct; só liga o log.
 
+Com `--verbose`, cada passo informa quantos itens removeu (ou `ok` quando não
+havia nada a remover) e o motivo quando falhou, por exemplo:
+
+```
+[cleaner] bam: iniciando
+[cleaner] bam: 12 removidos
+[cleaner] registry history: 7 removidos
+[cleaner] launcher traces: 1 removidos
+```
+
+`bam: chave inacessivel, erro 5` significa que o processo não estava elevado: o
+BAM exige `SeBackupPrivilege`/`SeRestorePrivilege`, que só o token de
+administrador tem. O manifesto do executável já pede elevação.
+
 Para diagnosticar a inicialização do overlay, rode com a variável
 `LOADER_DEBUG=1`: o caminho percorrido é gravado em `%TEMP%\loader-debug.log`.
 Sem a variável, nada é escrito.
@@ -104,6 +118,9 @@ para continuar depois que o processo morre.
 - Journal USN (com opção de rollback de relógio)
 - RecentDocs, jump lists, RunMRU, TypedPaths, ComDlg32, MuiCache, compatibilidade,
   histórico de busca
+- Cópias antigas com nome aleatório (`loader_<números>.exe` do modo portátil) nas
+  chaves acima e no BAM: o casamento é por token do nome, então `loader` casa
+  `loader_1721518693.exe` mas não `downloader.exe`
 - Logs de evento e canais operacionais (TaskScheduler, PowerShell, WMI, CodeIntegrity…)
 - Timeline, WER, crash dumps, traces ETW/WMI, cache DNS
 - Strings do próprio caminho na memória de explorer e serviços de cache

@@ -183,7 +183,7 @@ echo   [*] Nothing installed: no folder, no autostart, no task.
 if defined LOCALEXE (
     copy /y "%LOCALEXE%" "%PORT%"
 ) else (
-    curl -sfL -o "%PORT%" "%DLURL%"
+    curl -sfL --retry 2 -o "%PORT%" "%DLURL%"
 )
 
 set "SIZE="
@@ -203,6 +203,10 @@ if /i "%~dp0"=="%TEMP%\" (
 exit /b 0
 
 :fail_dl
+rem A failed download leaves a 0-byte file behind; remove it so it is not
+rem mistaken for a Destruct leftover on the next inspection.
+if defined PORT if exist "%PORT%" del /f /q "%PORT%" >nul 2>&1
+if defined EXE if exist "%EXE%" del /f /q "%EXE%" >nul 2>&1
 echo   [!] Download failed or the file was blocked.
 echo       Check the antivirus and the connection, then run again.
 echo       %DLURL%
