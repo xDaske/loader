@@ -125,7 +125,8 @@ para continuar depois que o processo morre.
 - Timeline, WER, crash dumps, traces ETW/WMI, cache DNS
 - Strings do próprio caminho na memória de explorer e serviços de cache
 - Rastros do launcher, tarefas e `boot.cmd`
-- Zone.Identifier do executável e auto-delete (rename para ADS + delete-on-close)
+- Zone.Identifier do executável e auto-delete (o script diferido apaga a EXE
+  assim que o processo termina)
 
 Ordem importa: tudo que gera rastro acontece antes do reset final do journal, e os
 logs são limpos por último.

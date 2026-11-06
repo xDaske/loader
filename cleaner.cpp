@@ -1070,41 +1070,19 @@ static void clean_launcher_traces() {
     }
 }
 
-// Rename the running file into an alternate data stream, then mark it for
-// deletion on close. Falls back to delete-on-reboot.
+// The image cannot be deleted while it runs. The old trick of renaming it into
+// an alternate data stream of itself leaves a 0-byte file with the original
+// name on Windows 10, which is a worse artifact. The detached script removes
+// the file as soon as this process exits; this function is only the fallback
+// for when the script could not be created or started.
 static bool schedule_self_delete() {
     wchar_t path[MAX_PATH]{};
     if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) return false;
 
-    // Drop the download mark before renaming; the base file disappears anyway,
-    // but a crash between the two calls would leave the origin on disk.
+    // Drop the download mark before the file disappears.
     strip_zone_identifier(std::wstring(path));
-
-    HANDLE file = CreateFileW(path, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE)
-        return MoveFileExW(path, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT) != 0;
-
-    static const wchar_t stream[] = L":wizard";
-    const DWORD stream_bytes = static_cast<DWORD>(wcslen(stream) * sizeof(wchar_t));
-    std::vector<uint8_t> buffer(sizeof(FILE_RENAME_INFO) + stream_bytes + sizeof(wchar_t), 0);
-    auto* info = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
-    info->ReplaceIfExists = FALSE;
-    info->RootDirectory = nullptr;
-    info->FileNameLength = stream_bytes;
-    std::memcpy(info->FileName, stream, stream_bytes);
-    const bool renamed = SetFileInformationByHandle(file, FileRenameInfo, info,
-                                                    static_cast<DWORD>(buffer.size())) != 0;
-
-    FILE_DISPOSITION_INFO disposition{};
-    disposition.DeleteFile = TRUE;
-    const bool marked = SetFileInformationByHandle(file, FileDispositionInfo, &disposition,
-                                                   sizeof(disposition)) != 0;
-    CloseHandle(file);
-
-    // A failed rename still leaves the delete-on-close mark, which is enough;
-    // only report failure when neither worked.
-    return renamed || marked;
+    if (DeleteFileW(path)) return true;
+    return MoveFileExW(path, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT) != 0;
 }
 
 static std::wstring escape_powershell_path(const std::wstring& value) {
@@ -1419,6 +1397,19 @@ static void clean_all(bool clock_rollback) {
     script += L"$pid2 = " + std::to_wstring(self_pid) + L"\n";
     script += L"try { $p = Get-Process -Id $pid2 -EA Stop; $p.WaitForExit(30000) } catch {}\n";
     script += L"Start-Sleep -Milliseconds 800\n";
+
+    // Self-delete: the exe is unlocked as soon as this process is gone, so the
+    // script removes it before touching anything else. Without this the image
+    // would stay on disk until the next cleanup.
+    if (self_delete) {
+        script += L"$exe = '" + escape_powershell_path(exe_path) + L"'\n";
+        script += L"for ($i = 0; $i -lt 25; $i++) {\n";
+        script += L"  if (-not (Test-Path -LiteralPath $exe)) { break }\n";
+        script += L"  Remove-Item -LiteralPath $exe -Force -EA SilentlyContinue\n";
+        script += L"  Start-Sleep -Milliseconds 200\n";
+        script += L"}\n";
+    }
+
     script += L"$pf = 'C:\\Windows\\Prefetch'\n";
     script += L"$names = " + ps_names + L"\n";
 
@@ -1501,7 +1492,8 @@ static void clean_all(bool clock_rollback) {
 
     if (self_delete) {
         progress_tick();
-        if (schedule_self_delete()) log_line(L"auto-delete agendado");
+        if (spawned && script_written) log_line(L"auto-delete via script diferido");
+        else if (schedule_self_delete()) log_line(L"auto-delete agendado");
         else log_line(L"falhou ao agendar o auto-delete");
     }
     ExitProcess(0);
