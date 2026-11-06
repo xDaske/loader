@@ -76,6 +76,7 @@ static std::atomic<bool> g_watchdog_started{false};
 // Per-pass bookkeeping. The two cleaner threads run different passes, so a
 // thread-local slot is enough and keeps the counters race-free.
 static thread_local unsigned long g_pass_removed = 0;
+static thread_local unsigned long g_pass_failed = 0;
 static thread_local bool g_pass_counted = false;
 static thread_local std::wstring g_pass_detail;
 
@@ -83,6 +84,8 @@ static void note_removed(unsigned long count = 1) {
     g_pass_removed += count;
     g_pass_counted = true;
 }
+
+static void note_failed() { ++g_pass_failed; }
 
 static void note_detail(const std::wstring& text) {
     if (g_pass_detail.empty()) g_pass_detail = text;
@@ -550,13 +553,24 @@ static void clean_shim_cache() {
     RegCloseKey(key);
 }
 
+static std::wstring rot13(std::wstring text) {
+    for (auto& c : text) {
+        if (c >= L'a' && c <= L'z') c = static_cast<wchar_t>((c - L'a' + 13) % 26 + L'a');
+        else if (c >= L'A' && c <= L'Z') c = static_cast<wchar_t>((c - L'A' + 13) % 26 + L'A');
+    }
+    return text;
+}
+
 static void clean_user_assist() {
     HKEY users = nullptr;
     if (RegOpenKeyExW(HKEY_USERS, nullptr, 0, KEY_ENUMERATE_SUB_KEYS, &users) != ERROR_SUCCESS)
         return;
 
-    // ROT13 of phantom, cypher, ph_, openiv, runtimebroker, loader.
-    const wchar_t* rot13[] = { L"cuncgbz", L"plcure", L"cu_", L"bcravie", L"ehagvzroebyxre", L"ybnqre" };
+    // ROT13 of phantom, cypher, ph_, openiv, runtimebroker, loader, fivem_esp
+    // and cheat; the current file name is encoded too, for renamed copies.
+    std::vector<std::wstring> needles = { L"cuncgbz", L"plcure", L"cu_", L"bcravie",
+                                          L"ehagvzroebyxre", L"ybnqre", L"svirz_rfc", L"purng" };
+    if (!self_name().empty()) needles.push_back(rot13(self_name()));
     for (DWORD sid_index = 0;; ++sid_index) {
         wchar_t sid[256];
         DWORD sid_length = 256;
@@ -589,14 +603,17 @@ static void clean_user_assist() {
                     break;
                 std::wstring lower(value);
                 for (auto& c : lower) c = static_cast<wchar_t>(towlower(c));
-                for (const wchar_t* needle : rot13) {
+                for (const auto& needle : needles) {
                     if (lower.find(needle) != std::wstring::npos) {
                         to_delete.push_back(value);
                         break;
                     }
                 }
             }
-            for (const auto& name : to_delete) RegDeleteValueW(count, name.c_str());
+            for (const auto& name : to_delete) {
+                if (RegDeleteValueW(count, name.c_str()) == ERROR_SUCCESS) note_removed();
+                else note_failed();
+            }
             RegCloseKey(count);
         }
         RegCloseKey(assist);
@@ -605,19 +622,47 @@ static void clean_user_assist() {
 }
 
 static void clean_amcache() {
-    enable_privilege(L"SeBackupPrivilege");
-    enable_privilege(L"SeRestorePrivilege");
+    const bool backup = enable_privilege(L"SeBackupPrivilege");
+    const bool restore = enable_privilege(L"SeRestorePrivilege");
 
     wchar_t windows_dir[MAX_PATH]{};
     GetWindowsDirectoryW(windows_dir, MAX_PATH);
-    const std::wstring hive = std::wstring(windows_dir) + L"\\appcompat\\Programs\\Amcache.hve";
+    const std::wstring dir = std::wstring(windows_dir) + L"\\appcompat\\Programs";
+    const std::wstring hive = dir + L"\\Amcache.hve";
     const wchar_t* mount = L"AMCACHE_TMP";
     RegUnLoadKeyW(HKEY_LOCAL_MACHINE, mount);
-    if (RegLoadKeyW(HKEY_LOCAL_MACHINE, mount, hive.c_str()) != ERROR_SUCCESS) return;
+    if (RegLoadKeyW(HKEY_LOCAL_MACHINE, mount, hive.c_str()) != ERROR_SUCCESS) {
+        note_detail(std::wstring(L"hive nao carregou") +
+                    (backup && restore ? L"" : L", privilegios indisponiveis"));
+        return;
+    }
 
+    // Both layouts exist: Root\File\<volume>\<entry> and
+    // Root\InventoryApplicationFile\<entry>. Check every level instead of
+    // assuming which one is a container.
     const wchar_t* roots[] = {
         L"AMCACHE_TMP\\Root\\File",
         L"AMCACHE_TMP\\Root\\InventoryApplicationFile"
+    };
+
+    const wchar_t* paths[] = { nullptr, L"FullPath", L"LowerCaseLongPath", L"Name", L"Path" };
+    auto entry_matches = [&](HKEY key) {
+        for (const wchar_t* value_name : paths) {
+            wchar_t value[1024]{};
+            DWORD size = sizeof(value);
+            DWORD type = 0;
+            if (RegQueryValueExW(key, value_name, nullptr, &type,
+                                 reinterpret_cast<LPBYTE>(value), &size) != ERROR_SUCCESS)
+                continue;
+            if (type != REG_SZ && type != REG_EXPAND_SZ) continue;
+            value[1023] = 0;
+            std::wstring lower(value);
+            for (auto& c : lower) c = static_cast<wchar_t>(towlower(c));
+            if (contains_any(lower, { L"phantom", L"cypher", L"ph_", L"cheat", L"openiv",
+                                      L"runtimebroker", L"loader", L"fivem_esp" }))
+                return true;
+        }
+        return false;
     };
 
     for (const wchar_t* root_path : roots) {
@@ -626,58 +671,71 @@ static void clean_amcache() {
                           KEY_ALL_ACCESS | KEY_WOW64_64KEY, &root) != ERROR_SUCCESS)
             continue;
 
-        std::vector<std::wstring> containers;
+        std::vector<std::wstring> children;
         for (DWORD index = 0;; ++index) {
-            wchar_t container[256];
+            wchar_t child[256];
             DWORD length = 256;
-            if (RegEnumKeyExW(root, index, container, &length, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+            if (RegEnumKeyExW(root, index, child, &length, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
                 break;
-            containers.push_back(container);
+            children.push_back(child);
         }
 
-        for (const auto& container : containers) {
-            HKEY container_key = nullptr;
-            if (RegOpenKeyExW(root, container.c_str(), 0, KEY_ALL_ACCESS, &container_key) != ERROR_SUCCESS)
+        std::vector<std::wstring> to_delete;
+        for (const auto& child : children) {
+            HKEY child_key = nullptr;
+            if (RegOpenKeyExW(root, child.c_str(), 0, KEY_READ, &child_key) != ERROR_SUCCESS)
                 continue;
+            const bool direct = entry_matches(child_key);
+            RegCloseKey(child_key);
+            if (direct) {
+                to_delete.push_back(child);
+                continue;
+            }
 
-            std::vector<std::wstring> to_delete;
+            // Not an entry: it is the per-volume container of Root\File.
+            HKEY container_key = nullptr;
+            if (RegOpenKeyExW(root, child.c_str(), 0, KEY_ALL_ACCESS, &container_key) != ERROR_SUCCESS)
+                continue;
             for (DWORD index = 0;; ++index) {
                 wchar_t entry[256];
                 DWORD length = 256;
                 if (RegEnumKeyExW(container_key, index, entry, &length, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
                     break;
-
                 HKEY entry_key = nullptr;
                 if (RegOpenKeyExW(container_key, entry, 0, KEY_READ, &entry_key) != ERROR_SUCCESS)
                     continue;
-
-                wchar_t value[1024]{};
-                DWORD value_size = sizeof(value);
-                if (RegQueryValueExW(entry_key, L"FullPath", nullptr, nullptr,
-                                     reinterpret_cast<LPBYTE>(value), &value_size) != ERROR_SUCCESS) {
-                    value_size = sizeof(value);
-                    RegQueryValueExW(entry_key, nullptr, nullptr, nullptr,
-                                     reinterpret_cast<LPBYTE>(value), &value_size);
-                }
+                const bool match = entry_matches(entry_key);
                 RegCloseKey(entry_key);
-
-                std::wstring lower(value);
-                for (auto& c : lower) c = static_cast<wchar_t>(towlower(c));
-                if (contains_any(lower, { L"phantom", L"cypher", L"ph_", L"cheat", L"openiv", L"runtimebroker", L"loader" }))
-                    to_delete.push_back(entry);
+                if (match) {
+                    if (RegDeleteTreeW(container_key, entry) == ERROR_SUCCESS) note_removed();
+                    else note_failed();
+                }
             }
-            for (const auto& name : to_delete) RegDeleteKeyW(container_key, name.c_str());
             RegCloseKey(container_key);
+        }
+
+        for (const auto& name : to_delete) {
+            if (RegDeleteTreeW(root, name.c_str()) == ERROR_SUCCESS) note_removed();
+            else note_failed();
         }
         RegCloseKey(root);
     }
     RegFlushKey(HKEY_LOCAL_MACHINE);
     RegUnLoadKeyW(HKEY_LOCAL_MACHINE, mount);
 
-    // The transaction logs keep a replayable copy of the deleted keys.
-    delete_if_exists(hive + L".LOG1");
-    delete_if_exists(hive + L".LOG2");
-    delete_if_exists(hive + L".regtrans-ms");
+    // The transaction manager keeps replayable copies of the deleted keys in
+    // Amcache.hve{GUID}.TM.blf and .TMContainer*.regtrans-ms, not in .LOG1.
+    // Remove every auxiliary file; only the hive itself stays.
+    WIN32_FIND_DATAW entry{};
+    HANDLE find = FindFirstFileW((hive + L"*").c_str(), &entry);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            if (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (_wcsicmp(entry.cFileName, L"Amcache.hve") == 0) continue;
+            delete_if_exists(dir + L"\\" + entry.cFileName);
+        } while (FindNextFileW(find, &entry));
+        FindClose(find);
+    }
 }
 
 static DWORD service_process_id(const wchar_t* service_name) {
@@ -801,7 +859,12 @@ static void wipe_self_strings() {
 
 static void delete_if_exists(const std::wstring& path) {
     SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
-    if (DeleteFileW(path.c_str())) note_removed();
+    if (DeleteFileW(path.c_str())) {
+        note_removed();
+        return;
+    }
+    const DWORD error = GetLastError();
+    if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) note_failed();
 }
 
 static void delete_temp_pattern(const std::wstring& dir, const wchar_t* pattern) {
@@ -1297,13 +1360,18 @@ static void clean_registry_history() {
 static void run_pass(const wchar_t* name, void (*pass)()) {
     log_line(std::wstring(name) + L": iniciando");
     g_pass_removed = 0;
+    g_pass_failed = 0;
     g_pass_counted = false;
     g_pass_detail.clear();
     try {
         pass();
-        std::wstring summary = g_pass_counted
-            ? std::wstring(name) + L": " + std::to_wstring(g_pass_removed) + L" removidos"
-            : std::wstring(name) + L": ok";
+        std::wstring summary = std::wstring(name) + L": ";
+        if (g_pass_counted) summary += std::to_wstring(g_pass_removed) + L" removidos";
+        else if (!g_pass_failed) summary += L"ok";
+        if (g_pass_failed) {
+            if (g_pass_counted) summary += L", ";
+            summary += std::to_wstring(g_pass_failed) + L" falhas";
+        }
         if (!g_pass_detail.empty()) summary += L" (" + g_pass_detail + L")";
         log_line(summary);
     } catch (...) {
