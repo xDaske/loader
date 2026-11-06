@@ -90,6 +90,13 @@ static void note_detail(const std::wstring& text) {
 }
 
 static void verbose_attach_console() {
+    // Respect an explicit redirect: "loader --destruct --verbose 2> log.txt"
+    // must write to the file, not to the parent console.
+    HANDLE current = GetStdHandle(STD_ERROR_HANDLE);
+    if (current && current != INVALID_HANDLE_VALUE) {
+        const DWORD type = GetFileType(current);
+        if (type == FILE_TYPE_PIPE || type == FILE_TYPE_DISK) return;
+    }
     if (!AttachConsole(ATTACH_PARENT_PROCESS)) return;
     HANDLE out = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, nullptr,
                              OPEN_EXISTING, 0, nullptr);

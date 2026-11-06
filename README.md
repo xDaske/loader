@@ -85,7 +85,7 @@ se chama exatamente `loader.exe` em `releases/latest/download/`.
 | `--destruct-keep` | Passada completa e mantém o executável |
 | `--rollback` | Adiciona o deslocamento de relógio de 8d12h antes do USN |
 | `--no-deep` | Pula o reset do SRUM (único passo que para um serviço) |
-| `--verbose` | Mostra o progresso no console do processo pai (nada em disco) |
+| `--verbose` | Mostra o progresso no console do processo pai (ou no `stderr`, se redirecionado; nada em disco) |
 
 `--verbose` sozinho não inicia o Destruct; só liga o log.
 
