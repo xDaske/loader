@@ -911,13 +911,20 @@ static bool reboot_delete_pending(const std::wstring& path) {
                              reinterpret_cast<LPBYTE>(buffer.data()), &size) == ERROR_SUCCESS) {
             std::wstring lower = path;
             for (auto& c : lower) c = static_cast<wchar_t>(towlower(c));
-            for (const wchar_t* entry = buffer.data(); *entry; entry += wcslen(entry) + 1) {
-                std::wstring candidate(entry);
-                for (auto& c : candidate) c = static_cast<wchar_t>(towlower(c));
-                if (candidate.find(lower) != std::wstring::npos) {
-                    found = true;
-                    break;
+            // REG_MULTI_SZ is "source\0destination\0source\0destination\0\0" and
+            // the destination of a delete is an empty string, so an empty entry
+            // must be skipped instead of ending the loop.
+            const size_t cells = size / sizeof(wchar_t);
+            for (size_t cell = 0; cell + 1 < cells;) {
+                std::wstring candidate(buffer.data() + cell);
+                if (!candidate.empty()) {
+                    for (auto& c : candidate) c = static_cast<wchar_t>(towlower(c));
+                    if (candidate.find(lower) != std::wstring::npos) {
+                        found = true;
+                        break;
+                    }
                 }
+                cell += candidate.size() + 1;
             }
         }
     }
