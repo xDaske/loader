@@ -1724,7 +1724,10 @@ static void clean_all(bool clock_rollback) {
 
     // Log clearing goes last: schtasks, fsutil and wevtutil above write their
     // own events after the native pass already cleared the channels.
-    for (const wchar_t* channel : { L"Application", L"System", L"Security", L"Setup",
+    // System is cleared last on purpose: every "log was cleared" marker (104)
+    // lands in System, so clearing it afterwards erases the markers for the
+    // other channels. Only System's own marker survives.
+    for (const wchar_t* channel : { L"Application", L"Security", L"Setup",
              L"Microsoft-Windows-TaskScheduler/Operational",
              L"Microsoft-Windows-PowerShell/Operational", L"Windows PowerShell",
              L"Microsoft-Windows-Application-Experience/Program-Inventory",
@@ -1735,6 +1738,7 @@ static void clean_all(bool clock_rollback) {
              L"Microsoft-Windows-Diagnosis-Scripted/Operational",
              L"Microsoft-Windows-CodeIntegrity/Operational" })
         script += std::wstring(L"wevtutil cl '") + channel + L"' 2>&1 | Out-Null\n";
+    script += L"wevtutil cl 'System' 2>&1 | Out-Null\n";
 
     script += L"Start-Sleep -Milliseconds 500\n";
     script += L"Clear-Pf\n";

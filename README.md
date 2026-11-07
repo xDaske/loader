@@ -145,7 +145,9 @@ logs são limpos por último.
 ## Limites conhecidos
 
 - O evento 1102/104 ("log limpo") é gerado pelo próprio Windows e não tem como
-  ser evitado sem apagar o `.evtx` com o serviço parado.
+  ser evitado sem apagar o `.evtx` com o serviço parado. O `System` é limpo por
+  último, então sobra só o marcador do próprio `System`; os marcadores dos outros
+  canais são apagados junto.
 - O `clear` não zera o slack dos `.evtx`.
 - O registro `$MFT` do executável fica órfão após o rename; zerar exige acesso raw
   ao volume.
