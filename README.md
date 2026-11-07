@@ -67,6 +67,11 @@ se chama exatamente `loader.exe` em `releases/latest/download/`.
 
 - **F1** abre/fecha o painel.
 - **F2** também abre/fecha o painel.
+- No b3889 o nome exibido vem do bloco `player:<id>` na memória do jogo; se o
+  mesmo id aparecer com dois nomes diferentes, o ESP omite o nome em vez de
+  alternar entre eles.
+- O selo `NoClip?` no b3889 é heurístico: exige a combinação de altura, flags da
+  entidade e o teste de solo do `los_probe`, por isso o ponto de interrogação.
 - O painel só responde quando a janela do FiveM (ou o próprio painel) está em foco.
 - A tecla de saída configurada ejeta o hook e encerra.
 - As três janelas (painel, amigos e overlay) usam `WDA_EXCLUDEFROMCAPTURE`
@@ -96,8 +101,12 @@ havia nada a remover) e o motivo quando falhou, por exemplo:
 [cleaner] bam: iniciando
 [cleaner] bam: 12 removidos
 [cleaner] registry history: 7 removidos
-[cleaner] launcher traces: 1 removidos
+[cleaner] timeline: 3 removidos (travados: agendados para o proximo boot)
+[cleaner] launcher traces: ok
 ```
+
+`launcher traces: ok` significa que não havia nada a remover — o executável em
+execução não conta como falha, porque o script diferido o apaga ao final.
 
 `bam: chave inacessivel, erro 5` significa que o processo não estava elevado: o
 BAM exige `SeBackupPrivilege`/`SeRestorePrivilege`, que só o token de
@@ -114,7 +123,9 @@ para continuar depois que o processo morre.
 
 - Prefetch (inclusive varredura do corpo do `.pf`), `Layout.ini` e o prefetch dos
   próprios utilitários usados na limpeza
-- BAM, ShimCache, UserAssist, Amcache (+ `LOG1`/`LOG2`/`regtrans-ms`)
+- BAM, ShimCache, UserAssist, Amcache (+ `LOG1`/`LOG2`/`regtrans-ms`). No
+  Amcache os dois layouts são cobertos: `Root\File\<volume>\<entrada>` e
+  `Root\InventoryApplicationFile\<entrada>`
 - Journal USN (com opção de rollback de relógio)
 - RecentDocs, jump lists, RunMRU, TypedPaths, ComDlg32, MuiCache, compatibilidade,
   histórico de busca
@@ -141,6 +152,13 @@ logs são limpos por último.
 - O Destruct não toca em Volume Shadow Copies.
 - Sem elevação, os passos que dependem de HKLM, Prefetch e USN falham — use
   `--verbose` para ver o que falhou.
+- `Amcache.hve` fica aberto pelo Windows; se outro processo mantiver o arquivo
+  travado, o hive não carrega e o passo reporta `hive nao carregou (erro N)` em
+  vez de fingir que não havia nada.
+- `ActivitiesCache.db` é mantido aberto pelo serviço de dispositivos conectados.
+  Quando não dá para apagar na hora, os arquivos entram em
+  `PendingFileRenameOperations` e somem no próximo boot; até lá essa chave cita o
+  nome `ActivitiesCache.db` (nunca o do loader).
 
 ## Estrutura
 

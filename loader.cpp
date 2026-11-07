@@ -85,11 +85,11 @@ struct Target {
     std::string weapon_name;
     float health, armor, distance, score;
     bool name_from_memory=false;
-    bool armed, weapon_known, invisible_suspected=false;
+    bool armed, weapon_known, invisible_suspected=false, noclip_candidate=false;
     bool blocked_by_base_map=false;
 };
-struct LosRequest { uintptr_t ped; Vec3 from, head, torso; float distance; };
-struct LosReading { ULONGLONG sampled_at; Vec3 from, head; bool blocked; };
+struct LosRequest { uintptr_t ped; Vec3 from, head, torso, feet; float distance; bool check_ground; };
+struct LosReading { ULONGLONG sampled_at; Vec3 from, head, feet; bool blocked, ground_clear; };
 static std::mutex los_mutex;
 static std::vector<LosRequest> los_requests;
 static std::unordered_map<uintptr_t,LosReading> los_readings;
@@ -157,12 +157,14 @@ static std::unordered_set<std::string> friend_names;
 static std::unordered_map<uint32_t,std::string> fivem_names;
 static std::unordered_map<uint32_t,std::string> client_names;
 static std::unordered_map<uint32_t,std::string> client_slot_names;
+static std::unordered_map<uint32_t,std::string> character_names;
 static std::mutex fivem_names_mutex;
 static std::atomic<uintptr_t> client_name_map_slot=0;
 static std::atomic<size_t> client_name_count=0;
 static std::atomic<bool> server_hides_player_ids=false;
 static std::atomic<bool> names_running=false;
 static std::thread names_thread;
+static std::thread character_names_thread;
 static RECT game_rect{};
 static std::array<float,16> view_matrix{};
 static std::string status_line;
@@ -207,7 +209,7 @@ static std::array<EspField,13> esp_fields{{
     {L"Vida (HP)",&EspVisibility::health,nullptr},
     {L"Colete",&EspVisibility::armor,nullptr},
     {L"Arma equipada",&EspVisibility::weapon,nullptr},
-    {L"Indicador NoClip",&EspVisibility::noclip,nullptr},
+    {L"Indicador NoClip?",&EspVisibility::noclip,nullptr},
     {L"Indicador Parede",&EspVisibility::wall,nullptr},
     {L"Marcador do veiculo",&EspVisibility::vehicle_marker,nullptr},
     {L"Modelo",&EspVisibility::vehicle_model,nullptr},
@@ -696,6 +698,112 @@ static void update_fivem_names() {
     std::lock_guard<std::mutex> lock(fivem_names_mutex);
     fivem_names=std::move(updated);
 }
+
+// b3889 keeps the character name inside a shared "player:<id>" block keyed by
+// the server id. The block is a small serialized structure: the id in ASCII,
+// then 00 00 05 'N' 'a' 'm' 'e' 00 and a length-prefixed string. Names that
+// appear with two different values for the same id are dropped instead of
+// flickering on screen.
+static std::unordered_map<uint32_t,std::string> parse_character_names(const std::vector<uint8_t>& bytes) {
+    std::unordered_map<uint32_t,std::string> names;
+    std::unordered_set<uint32_t> ambiguous;
+    constexpr char prefix[]="player:";
+    constexpr uint8_t key[]={0,0,5,'N','a','m','e',0};
+    for (size_t pos=0;pos+sizeof(prefix)+sizeof(key)+2<bytes.size();++pos) {
+        if (bytes[pos]!='p' || std::memcmp(bytes.data()+pos,prefix,sizeof(prefix)-1)!=0) continue;
+        size_t cursor=pos+sizeof(prefix)-1;
+        uint32_t id=0;
+        size_t digits=0;
+        while (cursor<bytes.size() && digits<5 && bytes[cursor]>='0' && bytes[cursor]<='9') {
+            id=id*10+bytes[cursor++]-'0';
+            ++digits;
+        }
+        if (!digits || !id || id>65535 || cursor+sizeof(key)+2>bytes.size() ||
+            std::memcmp(bytes.data()+cursor,key,sizeof(key))!=0) continue;
+        cursor+=sizeof(key);
+        const uint8_t marker=bytes[cursor++];
+        size_t length=0;
+        if (marker>=0xA0 && marker<=0xBF) length=marker&0x1F;
+        else if (marker==0xD9 && cursor<bytes.size()) length=bytes[cursor++];
+        else if (marker==0xDA && cursor+1<bytes.size()) {
+            length=(static_cast<size_t>(bytes[cursor])<<8)|bytes[cursor+1];
+            cursor+=2;
+        }
+        if (length<2 || length>80 || cursor+length>bytes.size()) continue;
+        bool printable=true;
+        for (size_t i=0;i<length;++i) {
+            uint8_t byte=bytes[cursor+i];
+            if (byte<32 || byte==127) { printable=false; break; }
+        }
+        if (!printable || ambiguous.contains(id)) continue;
+        std::string name(reinterpret_cast<const char*>(bytes.data()+cursor),length);
+        auto [found,inserted]=names.try_emplace(id,name);
+        if (!inserted && found->second!=name) {
+            names.erase(found);
+            ambiguous.insert(id);
+        }
+    }
+    return names;
+}
+static bool read_character_region(uintptr_t address,uintptr_t& base,
+                                  std::unordered_map<uint32_t,std::string>& names) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQueryEx(process_handle,reinterpret_cast<LPCVOID>(address),&info,sizeof(info))) return false;
+    const DWORD protection=info.Protect&0xFF;
+    if (info.State!=MEM_COMMIT || info.Type!=MEM_PRIVATE ||
+        (info.Protect&(PAGE_GUARD|PAGE_NOACCESS)) ||
+        (protection!=PAGE_READONLY && protection!=PAGE_READWRITE &&
+         protection!=PAGE_EXECUTE_READ && protection!=PAGE_EXECUTE_READWRITE &&
+         protection!=PAGE_WRITECOPY && protection!=PAGE_EXECUTE_WRITECOPY) ||
+        info.RegionSize<4096 || info.RegionSize>4*1024*1024) return false;
+    base=reinterpret_cast<uintptr_t>(info.BaseAddress);
+    std::vector<uint8_t> bytes(info.RegionSize);
+    SIZE_T received=0;
+    if (!ReadProcessMemory(process_handle,info.BaseAddress,bytes.data(),bytes.size(),&received) ||
+        received<64) return false;
+    bytes.resize(received);
+    names=parse_character_names(bytes);
+    return !names.empty();
+}
+static void character_name_refresh_loop() {
+    if (selected_build!=3889) return;
+    uintptr_t anchor=0;
+    while (names_running) {
+        std::unordered_map<uint32_t,std::string> best;
+        uintptr_t best_anchor=0;
+        if (anchor) {
+            uintptr_t base=0;
+            read_character_region(anchor,base,best);
+            if (best.size()>=2) best_anchor=base;
+        }
+        if (!best_anchor) {
+            best.clear();
+            for (uintptr_t address=0x10000;address<0x7FFFFFFEFFFFull && names_running;) {
+                MEMORY_BASIC_INFORMATION info{};
+                if (!VirtualQueryEx(process_handle,reinterpret_cast<LPCVOID>(address),&info,sizeof(info))) break;
+                uintptr_t base=reinterpret_cast<uintptr_t>(info.BaseAddress);
+                uintptr_t end=base+info.RegionSize;
+                if (end<=address) break;
+                if (info.State==MEM_COMMIT && info.Type==MEM_PRIVATE &&
+                    info.RegionSize>=4096 && info.RegionSize<=4*1024*1024) {
+                    std::unordered_map<uint32_t,std::string> candidate;
+                    uintptr_t region_base=0;
+                    if (read_character_region(base,region_base,candidate) && candidate.size()>best.size()) {
+                        best=std::move(candidate);
+                        best_anchor=region_base;
+                    }
+                }
+                address=end;
+            }
+        }
+        anchor=best.size()>=2 ? best_anchor : 0;
+        {
+            std::lock_guard<std::mutex> lock(fivem_names_mutex);
+            character_names=std::move(best);
+        }
+        for (int i=0;i<50 && names_running;++i) Sleep(100);
+    }
+}
 static void name_refresh_loop() {
     unsigned ticks=0;
     while (names_running) {
@@ -736,6 +844,9 @@ static std::string cached_player_name(uintptr_t info) {
         auto found=names.find(id);
         return found!=names.end() ? &found->second : nullptr;
     };
+    if (selected_build==3889) {
+        if (const std::string* character=lookup(character_names,server_id)) return *character;
+    }
     const std::string* first=lookup(client_names,server_id);
     const std::string* alternate=lookup(client_names,alternate_id);
     const std::string* slot_first=lookup(client_slot_names,server_id);
@@ -824,16 +935,25 @@ static bool los_read_line(std::string& line) {
     }
     return false;
 }
-static bool los_probe_ray(Vec3 from,Vec3 to) {
+// -1 = the helper did not answer or has no base map, 0 = the ray did not hit,
+// 1 = blocked. The noclip check needs the "no hit" case to be distinguishable
+// from "unknown", otherwise a missing base map looks like a clear ground.
+static int los_probe_ray_state(Vec3 from,Vec3 to) {
     char command[160];
     int length=std::snprintf(command,sizeof(command),"%.3f %.3f %.3f %.3f %.3f %.3f\n",
         from.x,from.y,from.z,to.x,to.y,to.z);
-    if (length<=0 || length>=static_cast<int>(sizeof(command))) return false;
+    if (length<=0 || length>=static_cast<int>(sizeof(command))) return -1;
     DWORD written=0;
     if (!WriteFile(los_input,command,static_cast<DWORD>(length),&written,nullptr) ||
-        written!=static_cast<DWORD>(length)) return false;
+        written!=static_cast<DWORD>(length)) return -1;
     std::string response;
-    return los_read_line(response) && response.rfind("state=blocked_static ",0)==0;
+    if (!los_read_line(response)) return -1;
+    if (response.rfind("state=blocked_static ",0)==0) return 1;
+    if (response.rfind("state=unknown reason=no_base_map_hit",0)==0) return 0;
+    return -1;
+}
+static bool los_probe_ray(Vec3 from,Vec3 to) {
+    return los_probe_ray_state(from,to)==1;
 }
 static void los_worker() {
     std::string response;
@@ -854,8 +974,16 @@ static void los_worker() {
             if (!los_running) break;
             bool blocked=los_probe_ray(request.from,request.head) &&
                          los_probe_ray(request.from,request.torso);
+            bool ground_clear=false;
+            if (request.check_ground) {
+                Vec3 above=request.feet,below=request.feet;
+                above.z+=1.0f;
+                below.z-=12.0f;
+                ground_clear=los_probe_ray_state(above,below)==0;
+            }
             std::lock_guard<std::mutex> lock(los_mutex);
-            los_readings[request.ped]={GetTickCount64(),request.from,request.head,blocked};
+            los_readings[request.ped]={GetTickCount64(),request.from,request.head,
+                request.feet,blocked,ground_clear};
             if (los_readings.size()>512) {
                 ULONGLONG now=GetTickCount64();
                 for (auto it=los_readings.begin();it!=los_readings.end();)
@@ -1004,6 +1132,15 @@ static void collect_targets(bool include_esp_details,bool include_aim) {
             if (read_at(ped+0x2C,entity_flags))
                 target.invisible_suspected=(entity_flags&0x01)==0;
         }
+        // b3889: a ped well above the local player with no entity at +0xD10 and
+        // entity flags without bit 0 or 4 is a noclip candidate. The ground
+        // probe below has to confirm it before the ESP shows the tag.
+        if ((include_esp_details || include_aim) && selected_build==3889 &&
+            position.z-local_pos.z>30.0f && !read_or<uintptr_t>(ped+0xD10)) {
+            uint8_t entity_flags=0;
+            target.noclip_candidate=read_at(ped+0x2C,entity_flags) &&
+                (entity_flags&0x11)==0;
+        }
         if (include_esp_details || !friend_names.empty())
             target.name=resolved_player_name(player_info,&target.name_from_memory);
         if (include_esp_details) {
@@ -1028,8 +1165,12 @@ static void collect_targets(bool include_esp_details,bool include_aim) {
             if (reading!=los_readings.end() &&
                 GetTickCount64()-reading->second.sampled_at<600 &&
                 los_distance_squared(from,reading->second.from)<0.56f &&
-                los_distance_squared(head,reading->second.head)<0.56f)
+                los_distance_squared(head,reading->second.head)<0.56f) {
                 target.blocked_by_base_map=reading->second.blocked;
+                target.invisible_suspected=target.noclip_candidate &&
+                    reading->second.ground_clear &&
+                    los_distance_squared(position,reading->second.feet)<0.56f;
+            }
         }
         target.sampled_at=GetTickCount64();
         targets.push_back(std::move(target));
@@ -1060,7 +1201,8 @@ static void collect_targets(bool include_esp_details,bool include_aim) {
             Vec3 head=target.bone_visible[0] ? target.hit :
                 Vec3{target.feet.x,target.feet.y,target.feet.z+1.6f};
             Vec3 torso{target.feet.x,target.feet.y,target.feet.z+1.0f};
-            next.push_back({target.ped,from,head,torso,target.distance});
+            next.push_back({target.ped,from,head,torso,target.feet,target.distance,
+                target.noclip_candidate});
         }
         std::lock_guard<std::mutex> lock(los_mutex);
         los_requests.swap(next);
@@ -1422,7 +1564,7 @@ static bool restore_hook() {
 
 static bool aim_target_allowed(const Target& target,uintptr_t aimed_ped,bool aimed_ped_valid) {
     return target.health>0.0f && (!aimed_ped_valid || target.ped==aimed_ped) &&
-        !target.invisible_suspected && !target.blocked_by_base_map &&
+        (selected_build==3889 || !target.invisible_suspected) && !target.blocked_by_base_map &&
         !marked_friend(target.player_info,target.name);
 }
 
@@ -2614,6 +2756,7 @@ int main() {
         start_los();
         names_running=true;
         names_thread=std::thread(name_refresh_loop);
+        if (selected_build==3889) character_names_thread=std::thread(character_name_refresh_loop);
         std::array<bool,256> previous_keys{};
         ULONGLONG last_player_poll=0,last_vehicle_poll=0,last_profile_poll=0;
         bool last_aim_held=false,last_player_esp=false,last_vehicle_esp=false;
@@ -2763,7 +2906,7 @@ int main() {
                 if (t.distance>app_settings.aim_radius_m || t.score>=effective_aim_radius_px(&t)) continue;
                 ++diagnostic.within_fov;
                 if (marked_friend(t.player_info,t.name)) { ++diagnostic.friends; continue; }
-                if (t.invisible_suspected) { ++diagnostic.noclip; continue; }
+                if (selected_build!=3889 && t.invisible_suspected) { ++diagnostic.noclip; continue; }
                 if (!aim_target_allowed(t,aimed_ped,aimed_ped_valid)) continue;
                 if (!t.sampled_at || selection_now<t.sampled_at ||
                     selection_now-t.sampled_at>50) { ++diagnostic.stale; continue; }
@@ -2797,6 +2940,7 @@ int main() {
         stop_los();
         names_running=false;
         if (names_thread.joinable()) names_thread.join();
+        if (character_names_thread.joinable()) character_names_thread.join();
         if (friends_window) DestroyWindow(friends_window);
         if (settings_window) DestroyWindow(settings_window);
         if (overlay_window) DestroyWindow(overlay_window);
@@ -2825,6 +2969,7 @@ int main() {
         stop_los();
         names_running=false;
         if (names_thread.joinable()) names_thread.join();
+        if (character_names_thread.joinable()) character_names_thread.join();
         if (friends_window) DestroyWindow(friends_window);
         if (settings_window) DestroyWindow(settings_window);
         if (overlay_window) DestroyWindow(overlay_window);
