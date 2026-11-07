@@ -932,9 +932,67 @@ static bool reboot_delete_pending(const std::wstring& path) {
     return found;
 }
 
-// Some files (notably ActivitiesCache.db, held open by the Connected Devices
-// Platform service) cannot be deleted while the service runs. Queue them for
-// removal at the next boot instead of leaving the artifact behind.
+// Removes any boot-time delete for this path. Used after an immediate delete
+// succeeds, so the registry does not keep naming the file until the next boot.
+static void drop_reboot_delete(const std::wstring& path) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SYSTEM\\CurrentControlSet\\Control\\Session Manager",
+                      0, KEY_QUERY_VALUE | KEY_SET_VALUE, &key) != ERROR_SUCCESS)
+        return;
+
+    DWORD type = 0;
+    DWORD size = 0;
+    if (RegQueryValueExW(key, L"PendingFileRenameOperations", nullptr, &type, nullptr, &size) == ERROR_SUCCESS &&
+        type == REG_MULTI_SZ && size > 2) {
+        std::vector<wchar_t> buffer(size / sizeof(wchar_t) + 2);
+        if (RegQueryValueExW(key, L"PendingFileRenameOperations", nullptr, &type,
+                             reinterpret_cast<LPBYTE>(buffer.data()), &size) == ERROR_SUCCESS) {
+            std::wstring lower = path;
+            for (auto& c : lower) c = static_cast<wchar_t>(towlower(c));
+
+            std::vector<wchar_t> kept;
+            bool changed = false;
+            const size_t cells = size / sizeof(wchar_t);
+            for (size_t cell = 0; cell + 1 < cells;) {
+                std::wstring source(buffer.data() + cell);
+                cell += source.size() + 1;
+                std::wstring destination;
+                if (cell < cells) {
+                    destination = buffer.data() + cell;
+                    cell += destination.size() + 1;
+                }
+                std::wstring lower_source = source;
+                for (auto& c : lower_source) c = static_cast<wchar_t>(towlower(c));
+                if (lower_source.find(lower) != std::wstring::npos) {
+                    changed = true;
+                    continue;
+                }
+                kept.insert(kept.end(), source.begin(), source.end());
+                kept.push_back(0);
+                kept.insert(kept.end(), destination.begin(), destination.end());
+                kept.push_back(0);
+            }
+
+            if (!changed) {
+                RegCloseKey(key);
+                return;
+            }
+            if (kept.empty()) {
+                RegDeleteValueW(key, L"PendingFileRenameOperations");
+            } else {
+                kept.push_back(0);
+                RegSetValueExW(key, L"PendingFileRenameOperations", 0, REG_MULTI_SZ,
+                               reinterpret_cast<const BYTE*>(kept.data()),
+                               static_cast<DWORD>(kept.size() * sizeof(wchar_t)));
+            }
+        }
+    }
+    RegCloseKey(key);
+}
+
+// Last resort: a file that still cannot be deleted is queued for the next
+// boot. The timeline pass stops the CDP service first, so it does not get here.
 static void delete_or_schedule(const std::wstring& path) {
     SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
     if (DeleteFileW(path.c_str())) {
@@ -1345,24 +1403,96 @@ static void clean_operational_logs() {
 }
 
 // Windows Timeline: one database per device account.
+// ActivitiesCache.db is held open by the per-user Connected Devices Platform
+// service. Stopping that instance is the only way to delete the file right
+// away; it is restarted as soon as the files are gone.
+static std::vector<std::wstring> stop_cdp_user_services() {
+    std::vector<std::wstring> stopped;
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr,
+                                   SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+    if (!scm) return stopped;
+
+    DWORD needed = 0, returned = 0;
+    EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_ACTIVE,
+                          nullptr, 0, &needed, &returned, nullptr, nullptr);
+    std::vector<BYTE> buffer(needed + sizeof(ENUM_SERVICE_STATUS_PROCESSW) * 4);
+    if (needed && EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_ACTIVE,
+                                        buffer.data(), static_cast<DWORD>(buffer.size()), &needed,
+                                        &returned, nullptr, nullptr)) {
+        auto* entries = reinterpret_cast<ENUM_SERVICE_STATUS_PROCESSW*>(buffer.data());
+        for (DWORD i = 0; i < returned; ++i) {
+            const std::wstring name = entries[i].lpServiceName;
+            if (name.rfind(L"CDPUserSvc", 0) != 0) continue;
+
+            SC_HANDLE service = OpenServiceW(scm, name.c_str(),
+                                             SERVICE_STOP | SERVICE_QUERY_STATUS);
+            if (!service) continue;
+            SERVICE_STATUS status{};
+            if (ControlService(service, SERVICE_CONTROL_STOP, &status)) {
+                for (int attempt = 0; attempt < 100; ++attempt) {
+                    SERVICE_STATUS_PROCESS info{};
+                    DWORD bytes = 0;
+                    if (QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                                             reinterpret_cast<LPBYTE>(&info), sizeof(info), &bytes) &&
+                        info.dwCurrentState == SERVICE_STOPPED)
+                        break;
+                    Sleep(50);
+                }
+                stopped.push_back(name);
+            }
+            CloseServiceHandle(service);
+        }
+    }
+    CloseServiceHandle(scm);
+    return stopped;
+}
+
+static void start_cdp_user_services(const std::vector<std::wstring>& names) {
+    if (names.empty()) return;
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) return;
+    for (const auto& name : names) {
+        SC_HANDLE service = OpenServiceW(scm, name.c_str(), SERVICE_START);
+        if (!service) continue;
+        StartServiceW(service, 0, nullptr);
+        CloseServiceHandle(service);
+    }
+    CloseServiceHandle(scm);
+}
+
 static void clean_timeline() {
     wchar_t local_app_data[MAX_PATH]{};
     if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local_app_data, MAX_PATH) || !local_app_data[0])
         return;
 
     const std::wstring base = std::wstring(local_app_data) + L"\\ConnectedDevicesPlatform";
+    // Stop before opening the folder: the service can recreate the file while
+    // the loop runs, and the delete would fail again.
+    const std::vector<std::wstring> stopped = stop_cdp_user_services();
+    if (!stopped.empty()) note_detail(L"servico CDP parado para apagar o timeline");
+
     WIN32_FIND_DATAW entry{};
     HANDLE find = FindFirstFileW((base + L"\\*").c_str(), &entry);
-    if (find == INVALID_HANDLE_VALUE) return;
-    do {
-        if (!(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-        if (wcscmp(entry.cFileName, L".") == 0 || wcscmp(entry.cFileName, L"..") == 0) continue;
-        const std::wstring dir = base + L"\\" + entry.cFileName;
-        for (const wchar_t* file : { L"\\ActivitiesCache.db", L"\\ActivitiesCache.db-wal",
-                                     L"\\ActivitiesCache.db-shm", L"\\ActivitiesCache.db-journal" })
-            delete_or_schedule(dir + file);
-    } while (FindNextFileW(find, &entry));
-    FindClose(find);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            if (wcscmp(entry.cFileName, L".") == 0 || wcscmp(entry.cFileName, L"..") == 0) continue;
+            const std::wstring dir = base + L"\\" + entry.cFileName;
+            for (const wchar_t* file : { L"\\ActivitiesCache.db", L"\\ActivitiesCache.db-wal",
+                                         L"\\ActivitiesCache.db-shm", L"\\ActivitiesCache.db-journal" }) {
+                const std::wstring full = dir + file;
+                delete_or_schedule(full);
+                // A previous version queued these for reboot; if the file is
+                // gone now the queued entry would be a stale pointer.
+                if (GetFileAttributesW(full.c_str()) == INVALID_FILE_ATTRIBUTES &&
+                    GetLastError() == ERROR_FILE_NOT_FOUND)
+                    drop_reboot_delete(full);
+            }
+        } while (FindNextFileW(find, &entry));
+        FindClose(find);
+    }
+
+    start_cdp_user_services(stopped);
 }
 
 // Windows Error Reporting archives the exe path in Report.wer and a zipped copy.

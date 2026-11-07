@@ -101,7 +101,7 @@ havia nada a remover) e o motivo quando falhou, por exemplo:
 [cleaner] bam: iniciando
 [cleaner] bam: 12 removidos
 [cleaner] registry history: 7 removidos
-[cleaner] timeline: 3 removidos (travados: agendados para o proximo boot)
+[cleaner] timeline: 3 removidos (servico CDP parado para apagar o timeline)
 [cleaner] launcher traces: ok
 ```
 
@@ -152,13 +152,13 @@ logs são limpos por último.
 - O Destruct não toca em Volume Shadow Copies.
 - Sem elevação, os passos que dependem de HKLM, Prefetch e USN falham — use
   `--verbose` para ver o que falhou.
+- `ActivitiesCache.db` fica aberto pelo serviço de dispositivos conectados. O
+  Destruct para a instância `CDPUserSvc_*` do usuário, apaga o banco na hora e
+  reinicia o serviço; nada fica esperando o próximo boot. Só se a parada do
+  serviço falhar o arquivo é agendado para remoção no boot (e o log avisa).
 - `Amcache.hve` fica aberto pelo Windows; se outro processo mantiver o arquivo
   travado, o hive não carrega e o passo reporta `hive nao carregou (erro N)` em
   vez de fingir que não havia nada.
-- `ActivitiesCache.db` é mantido aberto pelo serviço de dispositivos conectados.
-  Quando não dá para apagar na hora, os arquivos entram em
-  `PendingFileRenameOperations` e somem no próximo boot; até lá essa chave cita o
-  nome `ActivitiesCache.db` (nunca o do loader).
 
 ## Estrutura
 
